@@ -1,0 +1,13 @@
+# Rust
+/target/
+
+# Python
+/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Local env files
+.env
+
+# macOS
+.DS_Store

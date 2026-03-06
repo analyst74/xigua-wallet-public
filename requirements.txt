@@ -1,0 +1,3 @@
+# Python dependencies for repo tooling and skills.
+# Install with: ./.venv/bin/pip install -r requirements.txt
+
