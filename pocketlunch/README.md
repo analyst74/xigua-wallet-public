@@ -2,132 +2,124 @@
 
 Pocketlunch is a safe local workspace for letting an LLM review and fix your Lunch Money transaction categories, with a local copy of your data, controlled sync back to Lunch Money, and a full audit trail of every change.
 
+`pocketlunch` syncs your Lunch Money data into a local store, lets Codex or another LLM stage category fixes locally, and only pushes changes back to Lunch Money when you decide to sync. Every staged and pushed change is recorded in an audit trail.
 
-## Commands
+## Typical Use Case
 
-- `pocketlunch serve --host 0.0.0.0 --port 8080`
-- `pocketlunch sync pull`
-- `pocketlunch sync push`
-- `pocketlunch sync all`
-- `pocketlunch local categorize-apply --file <decisions.json>`
-- `pocketlunch local category-delete --category-id <id> [--force] [--reason <text>]`
-- `pocketlunch audit list --run-id <id> --entity transaction --entity-id 123`
-- `pocketlunch outbox requeue --change-id <uuid>`
+You import or sync a batch of transactions and many of them are uncategorized or obviously wrong. `pocketlunch` gives an LLM a controlled place to read your local copy of that data, suggest better categories, and stage fixes. You can review the queued changes first, then push them back to Lunch Money only when the results look right.
 
-## Environment
+## Category-Fix Workflow
 
-- `LUNCH_MONEY_API_TOKEN` (required for `sync` commands)
-- `LUNCH_MONEY_BASE_URL` (default: `https://api.lunchmoney.dev`)
-- `DATABASE_URL` (required, e.g. `postgres://user:pass@localhost:5432/pocketlunch`)
+Following instructions is for mac, it might work on linux, but definitely *NOT* work on Windows. Feel free to ask your favorite AI to translate it to your target environment.
 
-## Notes
+1. Create a `.env` file from the template.
+2. Add your `LUNCH_MONEY_API_TOKEN`.
+3. Start the containers with `./scripts/start.sh`.
+4. Open Codex inside `codex-runner`.
+5. Ask it to pull fresh data, fetch categories, and stage category fixes locally.
+6. Review the outbox and audit events.
+7. Ask it to push the reviewed changes.
 
-- Runs `sqlx` migrations on startup.
-- Keeps append-only `event_log` for audit reconstruction.
-- `pocketlunch-service` is now on-demand via HTTP API (no scheduled sync loop).
+The safest pattern is a two-step flow:
 
-## Service API
+- First prompt: pull data, analyze transactions, and stage fixes locally without pushing.
+- Second prompt: inspect the staged outbox and push only if it matches what you reviewed.
 
-Default base URL inside `app_net`: `http://pocketlunch-service:8080`
+## Step-By-Step
 
-- `GET /healthz`
-- `POST /v1/sync/pull`
-- `POST /v1/sync/pull-non-transactions`
-- `POST /v1/sync/push`
-- `POST /v1/sync/all`
-- `GET /v1/transactions?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&category_id=<id>&limit=<n>&offset=<n>`
-- `POST /v1/transactions` and `PUT /v1/transactions/:id` auto-enqueue category changes when `category_id` changes
-- `DELETE /v1/categories/:id?force=<bool>&reason=<text>` archives locally and enqueues remote category deletion
-- `GET /v1/outbox?limit=<n>&offset=<n>`
-- `POST /v1/outbox/requeue` with JSON body `{ "change_id": "..." }`
-- `GET /v1/audit/events?entity=category&limit=50`
+From the `pocketlunch/` directory:
 
-Example from `codex-runner`:
+1. Create your local config:
 
 ```bash
-curl -sS http://pocketlunch-service:8080/healthz
-curl -sS -X POST http://pocketlunch-service:8080/v1/sync/pull
-curl -sS "http://pocketlunch-service:8080/v1/transactions?start_date=2026-03-01&end_date=2026-03-05&limit=100&offset=0"
-curl -sS -X PUT http://pocketlunch-service:8080/v1/transactions/101 \
-  -H 'content-type: application/json' \
-  -d '{"category_id":22}'
-curl -sS -X DELETE "http://pocketlunch-service:8080/v1/categories/123?reason=cleanup"
-curl -sS "http://pocketlunch-service:8080/v1/outbox?limit=20&offset=0"
-curl -sS -X POST http://pocketlunch-service:8080/v1/sync/push
-curl -sS "http://pocketlunch-service:8080/v1/audit/events?entity=category&limit=10"
+cp .env.example .env
+chmod 600 .env
 ```
 
-## Canonical Workflow
+2. Edit `.env` and set your Lunch Money token:
 
-1. Read reference entities: `GET /v1/categories`, `GET /v1/assets`, and transactions with date filters.
-2. Decide categories in your client or automation layer.
-3. Apply local categorizations:
-   - `POST /v1/transactions` and `PUT /v1/transactions/:id` auto-enqueue outbox changes when `category_id` changes
-   - `DELETE /v1/categories/:id?force=<bool>&reason=<text>` enqueues category deletion
-4. Inspect current outbox if needed: `GET /v1/outbox?limit=...&offset=...`
-5. Push local outbox: `POST /v1/sync/push`
-6. Verify via audit: `GET /v1/audit/events?...`
+```dotenv
+LUNCH_MONEY_API_TOKEN=your_lunch_money_token_here
+```
 
-## Idempotency and Safe Retries
+Optional:
 
-- Local category decisions are deduped by an outbox idempotency key (`txn + category + base remote timestamp`).
-- `POST /v1/sync/push` is safe to retry; pending/failed rows are retried and applied rows are not reprocessed.
-- `POST /v1/outbox/requeue` resets failed/conflict rows to pending and records an audit event.
-- Audit log is append-only; inspect `source` + `action` to reconstruct mutation history.
+- Set `OPENAI_API_KEY=...` if you want Codex CLI to use API key auth.
+- If you leave `OPENAI_API_KEY` blank, you can log in later with `codex login --device-auth`.
 
-## Stack
-
-This stack includes an optional locked-down `codex-runner` container and strict network separation:
-- `codex-runner` on `app_net` only
-- `postgres` on `data_net` only (`internal: true`)
-- `pocketlunch-service` on both networks
-- only `./codex-context` is mounted into `codex-runner` (repo source is not mounted)
-- non-root users, `read_only`, `cap_drop: [ALL]`, and `no-new-privileges`
-
-Start:
+3. Start the stack:
 
 ```bash
 ./scripts/start.sh
 ```
 
-Files:
-- `docker-compose.yml`
-- `.env.example` -> `.env`
-- `Dockerfile.codex-runner`
-
-Use Codex inside the isolated runner:
+4. Open a shell inside the isolated runner:
 
 ```bash
-docker compose --env-file .env -f docker-compose.yml exec -it codex-runner codex --version
 docker compose --env-file .env -f docker-compose.yml exec -it codex-runner sh
-# then inside container:
+```
+
+5. Start Codex:
+
+```bash
 cd /workspace/context
-cat README.md
 codex
 ```
 
-If using ChatGPT login in `codex-runner`, run:
+6. Paste the review-and-stage prompt below into Codex.
 
-```bash
-docker compose --env-file .env -f docker-compose.yml exec -it codex-runner codex login --device-auth
+7. Review the results it reports:
+
+- changed transaction ids
+- queued outbox rows
+- sample audit events
+
+8. If the staged changes look right, paste the push prompt below.
+
+9. Confirm the final audit summary after push.
+
+## Example Prompts
+
+Review and stage only:
+
+```text
+Use the pocketlunch service.
+
+Task:
+1. Pull the latest data.
+2. Fetch categories.
+3. Fetch transactions for the target date range.
+4. Find transactions that are uncategorized or obviously miscategorized.
+5. Reassign categories conservatively based on merchant/payee/description and existing category patterns.
+6. Stage fixes locally by calling PUT /v1/transactions/:id with {"category_id": ...}.
+7. Do not push yet.
+
+Output:
+- A short summary of what you changed and why.
+- The transaction ids you changed.
+- The outbox rows created.
+- Audit events for sample changed transactions.
 ```
 
-Manage:
+Push after review:
 
-```bash
-docker compose --env-file .env -f docker-compose.yml logs -f
-docker compose --env-file .env -f docker-compose.yml down
+```text
+Use the pocketlunch service.
+
+Task:
+1. Read the current outbox.
+2. If there are only the staged category-fix changes we just reviewed, push them with POST /v1/sync/push.
+3. Then fetch audit events for the affected transactions and summarize what was applied.
+4. If any outbox item failed or conflicted, stop and report it instead of retrying blindly.
 ```
 
-## Accessing Postgres
+## Safety Model
 
-Postgres is not published to the host. Use `psql` inside the container:
+- The Lunch Money API token is used by `pocketlunch-service`, not handed directly to the LLM client.
+- The LLM works against the local service and local store.
+- Category changes are staged before push.
+- The outbox and audit log make every change inspectable.
 
-```bash
-docker compose --env-file .env -f docker-compose.yml exec postgres \
-  psql -U "${POSTGRES_USER:-pocketlunch}" -d "${POSTGRES_DB:-pocketlunch}"
-```
+## Getting Started
 
-Defaults are `POSTGRES_USER=pocketlunch` and `POSTGRES_DB=pocketlunch`; the password comes from `.env` via `POSTGRES_PASSWORD`.
-
-If you want host access from a local SQL client, publish `5432:5432` on the `postgres` service first.
+For HTTP API details, Docker topology, operator notes, and Postgres access, see [DEVELOPMENT.md](DEVELOPMENT.md).
