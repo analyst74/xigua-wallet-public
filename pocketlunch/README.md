@@ -1,6 +1,7 @@
 # pocketlunch
 
-A safe local LLM harness for reviewing and fixing Lunch Money transaction categories with full audit history.
+Pocketlunch is a safe local workspace for letting an LLM review and fix your Lunch Money transaction categories, with a local copy of your data, controlled sync back to Lunch Money, and a full audit trail of every change.
+
 
 ## Commands
 
