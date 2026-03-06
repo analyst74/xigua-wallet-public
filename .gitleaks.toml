@@ -1,0 +1,9 @@
+title = "xigua-wallet-public gitleaks config"
+
+[allowlist]
+description = "Allow obviously fake example placeholders used in docs and tests"
+regexes = [
+  '''postgres://user:pass@localhost:5432/pocketlunch''',
+  '''(?i)test-token''',
+  '''(?i)change_me''',
+]

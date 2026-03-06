@@ -9,5 +9,11 @@
 # Local env files
 .env
 
+# Scan artifacts
+scan-results/
+*.sarif
+*.gitleaks-report.*
+*.privacy-scan-report.*
+
 # macOS
 .DS_Store
