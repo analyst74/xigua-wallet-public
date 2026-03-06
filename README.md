@@ -5,6 +5,7 @@ A collection of tools built around Lunch Money.
 ## Layout
 
 - `pocketlunch/`: local LLM harness for reviewing and fixing Lunch Money transaction categories with full audit history.
+- `scripts/`: repo-level privacy and secret scanning helpers
 - `.githooks/`: committed Git hooks for local checks
 - `.github/workflows/`: CI workflows
 
