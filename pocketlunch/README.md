@@ -1,6 +1,6 @@
 # pocketlunch
 
-Rust + Postgres local-first sync engine for Lunch Money v2.
+A safe local LLM harness for reviewing and fixing Lunch Money transaction categories with full audit history.
 
 ## Commands
 
