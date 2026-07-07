@@ -6,7 +6,12 @@ RUN apt-get update \
 
 RUN npm install -g @openai/codex
 
-RUN mkdir -p /workspace/context /codex-home \
+ENV HOME=/codex-home \
+    NPM_CONFIG_CACHE=/codex-home/.npm \
+    NPM_CONFIG_PREFIX=/codex-home/.npm-global \
+    PATH=/codex-home/.npm-global/bin:$PATH
+
+RUN mkdir -p /workspace/context /codex-home/.npm /codex-home/.npm-global \
     && chown -R node:node /workspace /codex-home
 
 USER node

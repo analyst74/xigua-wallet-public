@@ -80,37 +80,20 @@ codex
 
 ## Example Prompts
 
-Review and stage only:
-
 ```text
-Use the pocketlunch service.
+Use the pocketlunch service, ref: README.md
 
 Task:
-1. Pull the latest data.
-2. Fetch categories.
-3. Fetch transactions for the target date range.
-4. Find transactions that are uncategorized or obviously miscategorized.
-5. Reassign categories conservatively based on merchant/payee/description and existing category patterns.
-6. Stage fixes locally by calling PUT /v1/transactions/:id with {"category_id": ...}.
-7. Do not push yet.
+- find last sync date
+- pull latest transactions from that date-1
+- categorize using all info from transactions, reference prior assignment where possible, otherwise use your judgement
+- push
 
 Output:
 - A short summary of what you changed and why.
 - The transaction ids you changed.
 - The outbox rows created.
 - Audit events for sample changed transactions.
-```
-
-Push after review:
-
-```text
-Use the pocketlunch service.
-
-Task:
-1. Read the current outbox.
-2. If there are only the staged category-fix changes we just reviewed, push them with POST /v1/sync/push.
-3. Then fetch audit events for the affected transactions and summarize what was applied.
-4. If any outbox item failed or conflicted, stop and report it instead of retrying blindly.
 ```
 
 ## Safety Model
