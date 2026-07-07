@@ -110,6 +110,23 @@ fn transaction_json(id: i64, category_id: i64, updated_at: &str) -> serde_json::
     })
 }
 
+fn account_json(id: i64, type_name: &str, balance: &str, to_base: f64) -> serde_json::Value {
+    json!({
+        "id": id,
+        "name": format!("Account {id}"),
+        "display_name": format!("Display {id}"),
+        "institution_name": "Test Bank",
+        "type": type_name,
+        "subtype": "test",
+        "status": "active",
+        "balance": balance,
+        "currency": "usd",
+        "to_base": to_base,
+        "balance_last_update": "2026-01-01T12:00:00Z",
+        "updated_at": "2026-01-01T12:00:00Z"
+    })
+}
+
 #[tokio::test]
 async fn bootstrap_and_cursor_update_work() -> anyhow::Result<()> {
     let Some(store) = setup_store().await? else {
@@ -127,6 +144,136 @@ async fn bootstrap_and_cursor_update_work() -> anyhow::Result<()> {
     let updated = store.get_sync_state("transactions").await?;
     assert_eq!(updated.last_remote_updated_at, "2026-01-01T00:10:00Z");
     assert_eq!(updated.last_success_run_id.as_deref(), Some("run-1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_balance_snapshot_is_limited_to_one_row_per_account_per_day() -> anyhow::Result<()>
+{
+    let Some(store) = setup_store().await? else {
+        return Ok(());
+    };
+
+    let first = account_json(201, "cash", "100.00", 100.0);
+    let second = account_json(201, "cash", "125.00", 125.0);
+
+    let inserted = store
+        .record_account_balance_snapshot(None, "plaid_account", &first)
+        .await?;
+    assert!(inserted);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    let updated = store
+        .record_account_balance_snapshot(None, "plaid_account", &second)
+        .await?;
+    assert!(updated);
+
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(1) FROM lm_account_balance_snapshots WHERE account_source='plaid_account' AND account_key='plaid_account:201'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(count.0, 1);
+
+    let row = sqlx::query(
+        "SELECT balance, to_base, networth_amount FROM lm_account_balance_snapshots WHERE account_source='plaid_account' AND account_key='plaid_account:201'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    let balance: String = row.try_get("balance")?;
+    let to_base: String = row.try_get("to_base")?;
+    let networth_amount: String = row.try_get("networth_amount")?;
+    assert_eq!(balance, "125.00");
+    assert_eq!(to_base, "125.0");
+    assert_eq!(networth_amount, "125.0");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_balance_snapshot_requires_to_base_for_active_networth_accounts(
+) -> anyhow::Result<()> {
+    let Some(store) = setup_store().await? else {
+        return Ok(());
+    };
+
+    let mut account = account_json(251, "investment", "100.00", 100.0);
+    account.as_object_mut().unwrap().remove("to_base");
+
+    let err = store
+        .record_account_balance_snapshot(None, "manual_account", &account)
+        .await
+        .expect_err("active asset account missing to_base should fail");
+
+    assert!(err.to_string().contains("missing required to_base"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn net_worth_history_view_sums_assets_minus_liabilities() -> anyhow::Result<()> {
+    let Some(store) = setup_store().await? else {
+        return Ok(());
+    };
+
+    store
+        .record_account_balance_snapshot(
+            None,
+            "plaid_account",
+            &account_json(301, "cash", "1000.00", 1000.0),
+        )
+        .await?;
+    store
+        .record_account_balance_snapshot(
+            None,
+            "plaid_account",
+            &account_json(302, "depository", "200.00", 200.0),
+        )
+        .await?;
+    store
+        .record_account_balance_snapshot(
+            None,
+            "manual_account",
+            &account_json(401, "credit", "50.00", 50.0),
+        )
+        .await?;
+    store
+        .record_account_balance_snapshot(
+            None,
+            "manual_account",
+            &account_json(402, "credit", "-25.00", -25.0),
+        )
+        .await?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            asset_account_count,
+            liability_account_count,
+            assets_total::float8 AS assets_total,
+            liabilities_total::float8 AS liabilities_total,
+            net_worth::float8 AS net_worth
+        FROM lm_net_worth_history
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_one(store.pool())
+    .await?;
+
+    let asset_count: i64 = row.try_get("asset_account_count")?;
+    let liability_count: i64 = row.try_get("liability_account_count")?;
+    let assets_total: f64 = row.try_get("assets_total")?;
+    let liabilities_total: f64 = row.try_get("liabilities_total")?;
+    let net_worth: f64 = row.try_get("net_worth")?;
+
+    assert_eq!(asset_count, 2);
+    assert_eq!(liability_count, 2);
+    assert_eq!(assets_total, 1200.0);
+    assert_eq!(liabilities_total, 25.0);
+    assert_eq!(net_worth, 1175.0);
 
     Ok(())
 }
@@ -342,7 +489,8 @@ async fn local_transaction_upsert_category_change_enqueues_outbox_change() -> an
 }
 
 #[tokio::test]
-async fn local_transaction_upsert_duplicate_enqueue_reuses_existing_outbox_row() -> anyhow::Result<()> {
+async fn local_transaction_upsert_duplicate_enqueue_reuses_existing_outbox_row(
+) -> anyhow::Result<()> {
     let Some(store) = setup_store().await? else {
         return Ok(());
     };
@@ -819,21 +967,17 @@ async fn local_read_model_mutations_are_rejected() -> anyhow::Result<()> {
         )
         .await
         .expect_err("assets local create should be rejected");
-    assert!(
-        asset_err
-            .to_string()
-            .contains("local write operations are not supported")
-    );
+    assert!(asset_err
+        .to_string()
+        .contains("local write operations are not supported"));
 
     let delete_err = store
         .delete_entity_record(None, "local", "categories", "9001")
         .await
         .expect_err("generic local delete should be rejected");
-    assert!(
-        delete_err
-            .to_string()
-            .contains("local delete operations are not supported")
-    );
+    assert!(delete_err
+        .to_string()
+        .contains("local delete operations are not supported"));
 
     Ok(())
 }

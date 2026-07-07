@@ -137,6 +137,40 @@ fn sample_transaction(category_id: i64, updated_at: &str) -> serde_json::Value {
     sample_transaction_with_id(101, category_id, updated_at)
 }
 
+fn sample_plaid_account(id: i64, type_name: &str, to_base: f64) -> serde_json::Value {
+    json!({
+        "id": id,
+        "name": format!("Plaid {id}"),
+        "display_name": format!("Plaid Display {id}"),
+        "institution_name": "Test Bank",
+        "type": type_name,
+        "subtype": "checking",
+        "status": "active",
+        "balance": format!("{to_base:.2}"),
+        "currency": "usd",
+        "to_base": to_base,
+        "balance_last_update": "2026-01-01T12:00:00Z",
+        "updated_at": "2026-01-01T12:00:00Z"
+    })
+}
+
+fn sample_manual_account(id: i64, type_name: &str, to_base: f64) -> serde_json::Value {
+    json!({
+        "id": id,
+        "name": format!("Manual {id}"),
+        "display_name": format!("Manual Display {id}"),
+        "institution_name": "Manual Bank",
+        "type": type_name,
+        "subtype": "manual",
+        "status": "active",
+        "balance": format!("{to_base:.2}"),
+        "currency": "usd",
+        "to_base": to_base,
+        "balance_as_of": "2026-01-01T12:00:00Z",
+        "updated_at": "2026-01-01T12:00:00Z"
+    })
+}
+
 #[tokio::test]
 async fn sync_all_is_idempotent_for_same_remote_data() -> anyhow::Result<()> {
     if !has_test_database() {
@@ -183,6 +217,82 @@ async fn sync_all_is_idempotent_for_same_remote_data() -> anyhow::Result<()> {
             .fetch_one(store.pool())
             .await?;
     assert_eq!(pull_event_count.0, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_pull_records_daily_account_balance_snapshots() -> anyhow::Result<()> {
+    if !has_test_database() {
+        return Ok(());
+    }
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/categories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/assets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/plaid_accounts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plaid_accounts": [sample_plaid_account(701, "cash", 500.0)]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/manual_accounts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "manual_accounts": [sample_manual_account(801, "loan", 125.0)]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let (store, engine) = setup_engine(&server).await?;
+
+    let run_id = engine.sync_pull().await?;
+
+    let snapshot_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(1) FROM lm_account_balance_snapshots")
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(snapshot_count.0, 2);
+
+    let stats_row = sqlx::query("SELECT stats_json FROM sync_runs WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await?;
+    let stats_json: String = stats_row.try_get("stats_json")?;
+    let stats: serde_json::Value = serde_json::from_str(&stats_json)?;
+    assert_eq!(stats["plaid_account_snapshots_recorded"], 1);
+    assert_eq!(stats["manual_account_snapshots_recorded"], 1);
+
+    let row = sqlx::query(
+        "SELECT assets_total::float8 AS assets_total, liabilities_total::float8 AS liabilities_total, net_worth::float8 AS net_worth FROM lm_net_worth_history LIMIT 1",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    let assets_total: f64 = row.try_get("assets_total")?;
+    let liabilities_total: f64 = row.try_get("liabilities_total")?;
+    let net_worth: f64 = row.try_get("net_worth")?;
+    assert_eq!(assets_total, 500.0);
+    assert_eq!(liabilities_total, 125.0);
+    assert_eq!(net_worth, 375.0);
 
     Ok(())
 }

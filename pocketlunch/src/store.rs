@@ -238,6 +238,16 @@ impl Store {
         Ok(())
     }
 
+    async fn primary_currency(&self) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT primary_currency FROM lm_me WHERE primary_currency IS NOT NULL LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|v| v.0))
+    }
+
     pub async fn category_exists(&self, category_id: i64) -> Result<bool> {
         let count: (i64,) = sqlx::query_as("SELECT COUNT(1) FROM lm_categories WHERE id = $1")
             .bind(category_id)
@@ -654,6 +664,8 @@ impl Store {
         let status = string_field(record, &["status"]);
         let balance = string_field(record, &["balance"]);
         let currency = string_field(record, &["currency"]);
+        let to_base = string_field(record, &["to_base"]);
+        let balance_last_update = string_field(record, &["balance_last_update", "balance_as_of"]);
         let remote_updated_at = remote_updated_at(record)?;
         let raw_json = serde_json::to_string(record)?;
 
@@ -679,9 +691,10 @@ impl Store {
             r#"
             INSERT INTO lm_plaid_accounts (
                 id, name, display_name, institution_name, type_name, subtype_name,
-                status, balance, currency, raw_json, remote_updated_at, local_updated_at
+                status, balance, currency, to_base, balance_last_update,
+                raw_json, remote_updated_at, local_updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 display_name = excluded.display_name,
@@ -691,6 +704,8 @@ impl Store {
                 status = excluded.status,
                 balance = excluded.balance,
                 currency = excluded.currency,
+                to_base = excluded.to_base,
+                balance_last_update = excluded.balance_last_update,
                 raw_json = excluded.raw_json,
                 remote_updated_at = excluded.remote_updated_at,
                 local_updated_at = excluded.local_updated_at
@@ -705,6 +720,8 @@ impl Store {
         .bind(status)
         .bind(balance)
         .bind(currency)
+        .bind(to_base)
+        .bind(balance_last_update)
         .bind(&raw_json)
         .bind(&remote_updated_at)
         .bind(now)
@@ -736,10 +753,15 @@ impl Store {
     ) -> Result<bool> {
         let id = int_field(record, &["id"]).context("manual account missing id")?;
         let name = string_field(record, &["name"]);
+        let display_name = string_field(record, &["display_name"]);
+        let institution_name = string_field(record, &["institution_name"]);
         let type_name = string_field(record, &["type"]);
         let subtype_name = string_field(record, &["subtype"]);
+        let status = string_field(record, &["status"]);
         let balance = string_field(record, &["balance"]);
         let currency = string_field(record, &["currency"]);
+        let to_base = string_field(record, &["to_base"]);
+        let balance_as_of = string_field(record, &["balance_as_of"]);
         let remote_updated_at = remote_updated_at(record)?;
         let raw_json = serde_json::to_string(record)?;
 
@@ -764,27 +786,38 @@ impl Store {
         sqlx::query(
             r#"
             INSERT INTO lm_manual_accounts (
-                id, name, type_name, subtype_name, balance, currency,
-                raw_json, remote_updated_at, local_updated_at
+                id, name, display_name, institution_name, type_name, subtype_name, status,
+                balance, currency, to_base, balance_as_of, raw_json, remote_updated_at,
+                local_updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
+                display_name = excluded.display_name,
+                institution_name = excluded.institution_name,
                 type_name = excluded.type_name,
                 subtype_name = excluded.subtype_name,
+                status = excluded.status,
                 balance = excluded.balance,
                 currency = excluded.currency,
+                to_base = excluded.to_base,
+                balance_as_of = excluded.balance_as_of,
                 raw_json = excluded.raw_json,
                 remote_updated_at = excluded.remote_updated_at,
                 local_updated_at = excluded.local_updated_at
-            "#,
+        "#,
         )
         .bind(id)
         .bind(name)
+        .bind(display_name)
+        .bind(institution_name)
         .bind(type_name)
         .bind(subtype_name)
+        .bind(status)
         .bind(balance)
         .bind(currency)
+        .bind(to_base)
+        .bind(balance_as_of)
         .bind(&raw_json)
         .bind(&remote_updated_at)
         .bind(now)
@@ -805,6 +838,101 @@ impl Store {
         .await?;
 
         Ok(true)
+    }
+
+    pub async fn record_account_balance_snapshot(
+        &self,
+        run_id: Option<&str>,
+        account_source: &str,
+        record: &Value,
+    ) -> Result<bool> {
+        let account_id = int_field(record, &["id"]).context("account snapshot missing id")?;
+        let account_key = format!("{account_source}:{account_id}");
+        let observed_at = now_rfc3339()?;
+        let snapshot_date = observed_at
+            .get(0..10)
+            .context("failed to derive snapshot date")?;
+        let raw_json = serde_json::to_string(record)?;
+        let content_hash = stable_content_hash(&raw_json);
+        let balance_as_of = match account_source {
+            "plaid_account" => string_field(record, &["balance_last_update", "balance_as_of"]),
+            "manual_account" => string_field(record, &["balance_as_of"]),
+            _ => string_field(record, &["balance_as_of", "balance_last_update"]),
+        };
+        let type_name = string_field(record, &["type_name", "type"]);
+        let networth_role = classify_networth_role(type_name.as_deref());
+        let status = string_field(record, &["status"]);
+        let to_base = string_field(record, &["to_base"]);
+        let networth_amount = networth_amount_for_snapshot(
+            networth_role,
+            status.as_deref(),
+            to_base.as_deref(),
+            &account_key,
+        )?;
+        let primary_currency = self.primary_currency().await?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO lm_account_balance_snapshots (
+                snapshot_date, account_source, account_key, observed_at, run_id,
+                account_id, name, display_name, institution_name, type_name, subtype_name,
+                status, balance, currency, to_base, balance_as_of, primary_currency,
+                networth_role, networth_amount, raw_json, content_hash
+            )
+            VALUES (
+                $1::date, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10, $11,
+                $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21
+            )
+            ON CONFLICT (snapshot_date, account_source, account_key)
+            DO UPDATE SET
+                observed_at = excluded.observed_at,
+                run_id = excluded.run_id,
+                account_id = excluded.account_id,
+                name = excluded.name,
+                display_name = excluded.display_name,
+                institution_name = excluded.institution_name,
+                type_name = excluded.type_name,
+                subtype_name = excluded.subtype_name,
+                status = excluded.status,
+                balance = excluded.balance,
+                currency = excluded.currency,
+                to_base = excluded.to_base,
+                balance_as_of = excluded.balance_as_of,
+                primary_currency = excluded.primary_currency,
+                networth_role = excluded.networth_role,
+                networth_amount = excluded.networth_amount,
+                raw_json = excluded.raw_json,
+                content_hash = excluded.content_hash
+            WHERE lm_account_balance_snapshots.observed_at < excluded.observed_at
+            "#,
+        )
+        .bind(snapshot_date)
+        .bind(account_source)
+        .bind(account_key)
+        .bind(&observed_at)
+        .bind(run_id)
+        .bind(account_id)
+        .bind(string_field(record, &["name"]))
+        .bind(string_field(record, &["display_name"]))
+        .bind(string_field(record, &["institution_name"]))
+        .bind(type_name)
+        .bind(string_field(record, &["subtype_name", "subtype"]))
+        .bind(status)
+        .bind(string_field(record, &["balance", "display_balance"]))
+        .bind(string_field(record, &["currency", "currency_code"]))
+        .bind(to_base)
+        .bind(balance_as_of)
+        .bind(primary_currency)
+        .bind(networth_role)
+        .bind(networth_amount)
+        .bind(raw_json)
+        .bind(content_hash)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn upsert_tag(
@@ -1068,7 +1196,10 @@ impl Store {
                 return Ok(false);
             }
             previous_remote_updated_at = Some(existing_updated_at);
-            previous_category_id = Some(int_field(&json_from_raw(existing_raw.clone()), &["category_id"]));
+            previous_category_id = Some(int_field(
+                &json_from_raw(existing_raw.clone()),
+                &["category_id"],
+            ));
             before_json = Some(existing_raw);
         }
 
@@ -1165,9 +1296,8 @@ impl Store {
         };
         let payload_json = serde_json::to_string(&payload)?;
         let change_id = Uuid::new_v4().to_string();
-        let idempotency_key = format!(
-            "txn:{transaction_id}:cat:{category_id}:base:{base_remote_updated_at}"
-        );
+        let idempotency_key =
+            format!("txn:{transaction_id}:cat:{category_id}:base:{base_remote_updated_at}");
         let now = now_rfc3339()?;
         let (change_id, inserted) = Self::insert_or_get_outbox_change(
             &self.pool,
@@ -1996,7 +2126,9 @@ fn normalize_upsert_action<'a>(source: &str, requested: &'a str, existed: bool) 
 
 fn int_field(value: &Value, keys: &[&str]) -> Option<i64> {
     for key in keys {
-        let field = value.get(*key)?;
+        let Some(field) = value.get(*key) else {
+            continue;
+        };
         if let Some(v) = field.as_i64() {
             return Some(v);
         }
@@ -2014,7 +2146,9 @@ fn int_field(value: &Value, keys: &[&str]) -> Option<i64> {
 
 fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
-        let field = value.get(*key)?;
+        let Some(field) = value.get(*key) else {
+            continue;
+        };
         if let Some(v) = field.as_str() {
             return Some(v.to_string());
         }
@@ -2027,7 +2161,9 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
 
 fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
     for key in keys {
-        let field = value.get(*key)?;
+        let Some(field) = value.get(*key) else {
+            continue;
+        };
         if let Some(v) = field.as_bool() {
             return Some(v);
         }
@@ -2060,4 +2196,83 @@ fn remote_updated_at(value: &Value) -> Result<String> {
     }
 
     now_rfc3339()
+}
+
+fn classify_networth_role(type_name: Option<&str>) -> &'static str {
+    match type_name.unwrap_or_default() {
+        "cash"
+        | "depository"
+        | "cryptocurrency"
+        | "employee compensation"
+        | "investment"
+        | "other asset"
+        | "real estate"
+        | "vehicle" => "asset",
+        "credit" | "loan" | "other liability" => "liability",
+        "" => "unknown",
+        _ => "unknown",
+    }
+}
+
+fn networth_amount_for_snapshot(
+    networth_role: &str,
+    status: Option<&str>,
+    to_base: Option<&str>,
+    account_key: &str,
+) -> Result<String> {
+    let is_closed = status
+        .map(|value| value.eq_ignore_ascii_case("closed"))
+        .unwrap_or(false);
+    if is_closed || !matches!(networth_role, "asset" | "liability") {
+        return Ok("0".to_string());
+    }
+
+    let to_base = to_base
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| {
+            format!("account balance snapshot {account_key} missing required to_base")
+        })?;
+    validate_numeric_text(to_base).with_context(|| {
+        format!("account balance snapshot {account_key} has invalid to_base: {to_base}")
+    })?;
+
+    if networth_role == "liability" {
+        return Ok(negate_numeric_text(to_base));
+    }
+
+    Ok(to_base.to_string())
+}
+
+fn validate_numeric_text(value: &str) -> Result<()> {
+    let parsed = value
+        .parse::<f64>()
+        .context("not a numeric value")?;
+    if !parsed.is_finite() {
+        anyhow::bail!("not a finite numeric value");
+    }
+    Ok(())
+}
+
+fn negate_numeric_text(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        return rest.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        return format!("-{rest}");
+    }
+    if trimmed.parse::<f64>().ok() == Some(0.0) {
+        return "0".to_string();
+    }
+    format!("-{trimmed}")
+}
+
+fn stable_content_hash(raw: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in raw.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }

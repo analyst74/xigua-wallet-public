@@ -197,7 +197,9 @@ impl SyncEngine {
         let mut categories_upserted = 0;
         let mut assets_upserted = 0;
         let mut plaid_accounts_upserted = 0;
+        let mut plaid_account_snapshots_recorded = 0;
         let mut manual_accounts_upserted = 0;
+        let mut manual_account_snapshots_recorded = 0;
         let mut tags_upserted = 0;
         let mut recurring_items_upserted = 0;
         let mut summary_upserted = 0;
@@ -249,6 +251,13 @@ impl SyncEngine {
             {
                 plaid_accounts_upserted += 1;
             }
+            if self
+                .store
+                .record_account_balance_snapshot(Some(run_id), "plaid_account", record)
+                .await?
+            {
+                plaid_account_snapshots_recorded += 1;
+            }
             max_plaid_accounts_updated =
                 max_timestamp(max_plaid_accounts_updated, extract_updated_at(record));
         }
@@ -261,6 +270,13 @@ impl SyncEngine {
                 .await?
             {
                 manual_accounts_upserted += 1;
+            }
+            if self
+                .store
+                .record_account_balance_snapshot(Some(run_id), "manual_account", record)
+                .await?
+            {
+                manual_account_snapshots_recorded += 1;
             }
             max_manual_accounts_updated =
                 max_timestamp(max_manual_accounts_updated, extract_updated_at(record));
@@ -416,8 +432,10 @@ impl SyncEngine {
             "assets_upserted": assets_upserted,
             "plaid_accounts_fetched": plaid_accounts.len(),
             "plaid_accounts_upserted": plaid_accounts_upserted,
+            "plaid_account_snapshots_recorded": plaid_account_snapshots_recorded,
             "manual_accounts_fetched": manual_accounts.len(),
             "manual_accounts_upserted": manual_accounts_upserted,
+            "manual_account_snapshots_recorded": manual_account_snapshots_recorded,
             "tags_fetched": tags.len(),
             "tags_upserted": tags_upserted,
             "recurring_items_fetched": recurring_items.len(),
